@@ -166,6 +166,31 @@ describe Bosh::OpenStackCloud::LoadbalancerConfigurator do
           }.to raise_error(Bosh::Clouds::CloudError, "Load balancer pool membership with pool id 'pool-id', ip 'wrong-ip', and port '8080' supposedly exists, but cannot be found.")
         end
       end
+
+      context 'when receiving 409 PENDING_UPDATE' do
+        let(:body) { { 'SomeError' => {'message' => 'Invalid state PENDING_UPDATE of loadbalancer resource 1234-abcd'}} }
+        let(:response) { instance_double('response', body: body) }
+
+        before do
+          allow(network).to receive(:create_lbaas_pool_member, &raise_times(2))
+        end
+
+        it 'attempts to create pool membership again' do
+            expect(network).to receive(:create_lbaas_pool_member).exactly(3)
+            expect(openstack).to receive(:wait_resource).exactly(4)
+
+            subject.create_membership('pool-id', 'wrong-ip', '8080', 'subnet-id')
+        end
+
+        def raise_times(times)
+          times_called = 0
+          -> (pool_id, ip, port, subnet_id) {
+            times_called += 1
+            raise Excon::Error::Conflict.new('omg pending_update', '', response) if times_called <= times
+            lb_member
+          }
+        end
+      end
     end
   end
 
@@ -400,6 +425,57 @@ describe Bosh::OpenStackCloud::LoadbalancerConfigurator do
         expect{
           subject.remove_vm_from_pool(pool_id, membership_id)
         }.to raise_error(Bosh::Clouds::CloudError, "Deleting LBaaS member with pool_id 'pool-id' and membership_id 'membership-id' failed. Reason: Fog::Network::OpenStack::Error BOOM!!!")
+      end
+
+      context 'because loadbalancer is in status PENDING_UPDATE' do
+        let(:body) { JSON.dump('SomeError' => {'message' => 'Invalid state PENDING_UPDATE of loadbalancer resource 1234-abcd'}) }
+        let(:response) { Excon::Response.new(body: body.to_s) }
+
+        before do
+          allow(network).to receive(:delete_lbaas_pool_member, &raise_times(2))
+        end
+
+        it 'attempts to delete again after loadbalancer has become active again' do
+          expect(network).to receive(:delete_lbaas_pool_member).exactly(3)
+          expect(openstack).to receive(:wait_resource).exactly(4)
+
+          subject.remove_vm_from_pool(pool_id, membership_id)
+        end
+
+        it 'logs the attempts' do
+          allow(logger).to receive(:debug)
+
+          subject.remove_vm_from_pool(pool_id, membership_id)
+
+          expect(logger).to have_received(:debug)
+              .with("Deletion of lbaas pool member failed with 'omg pending_update', unsuccessful attempts: '1'")
+              .with("Deletion of lbaas pool member failed with 'omg pending_update', unsuccessful attempts: '2'")
+        end
+
+        context 'when MAX_RETRIES have been reached' do
+          let(:retries) { Bosh::OpenStackCloud::Openstack::MAX_RETRIES }
+
+          before do
+             allow(network).to receive(:delete_lbaas_pool_member, &raise_times(retries + 1))
+          end
+
+          it 'fails with a CloudError, containing number of attempts' do
+            expect(network).to receive(:delete_lbaas_pool_member).exactly(retries)
+            expect(openstack).to receive(:wait_resource).exactly(retries)
+
+            expect {
+              subject.remove_vm_from_pool(pool_id, membership_id)
+            }.to raise_error Bosh::Clouds::CloudError, /Reason: Bosh::Clouds::CloudError Failed after 10 attempts with 'omg pending_update'/
+          end
+        end
+
+        def raise_times(times)
+          times_called = 0
+          -> (pool_id, membership_id) {
+            times_called += 1
+            raise Excon::Error::Conflict.new('omg pending_update', '', response) if times_called <= times
+          }
+        end
       end
     end
   end

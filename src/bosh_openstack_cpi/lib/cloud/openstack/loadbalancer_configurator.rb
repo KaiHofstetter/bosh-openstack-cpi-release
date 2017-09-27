@@ -32,30 +32,44 @@ module Bosh::OpenStackCloud
 
     def create_membership(pool_id, ip, port, subnet_id)
       @openstack.with_openstack do
+        loadbalancer_id = loadbalancer_id(pool_id)
+        resource = LoadBalancerResource.new(loadbalancer_id, @openstack)
+        attempts = 0
+        pool_created = false
         begin
-          loadbalancer_id = loadbalancer_id(pool_id)
-          resource = LoadBalancerResource.new(loadbalancer_id, @openstack)
-          @openstack.wait_resource(resource, :active, :provisioning_status)
-          pool_member_response = @openstack.network.create_lbaas_pool_member(pool_id, ip, port, {subnet_id: subnet_id})
-          @openstack.wait_resource(resource, :active, :provisioning_status)
-          pool_member_response.body['member']['id']
-        rescue LoadBalancerResource::NotFound, LoadBalancerResource::NotSupportedConfiguration => e
-          raise Bosh::Clouds::VMCreationFailed.new(false), e.message
-        rescue Excon::Error::Conflict
-          membership_id = @openstack
-            .network
-            .list_lbaas_pool_members(pool_id)
-            .body
-            .fetch('members', [])
-            .detect(
-              raise_if_not_found(pool_id, ip, port),
-              &matching_member(ip, port, subnet_id)
-            )
-            .fetch('id')
+          begin
+            @openstack.wait_resource(resource, :active, :provisioning_status)
+            attempts += 1
+            pool_member_response = @openstack.network.create_lbaas_pool_member(pool_id, ip, port, {subnet_id: subnet_id})
+            pool_created = true
+            @openstack.wait_resource(resource, :active, :provisioning_status)
+            pool_member_response.body['member']['id']
+          rescue LoadBalancerResource::NotFound, LoadBalancerResource::NotSupportedConfiguration => e
+            pool_created = false
+            raise Bosh::Clouds::VMCreationFailed.new(false), e.message
+          rescue Excon::Error::Conflict => e
+            if(e.message.include? 'pending_update' )
+              @logger.debug("Creation of lbaas pool member failed with '#{e.message}', unsuccessful attempts: '#{attempts}'")
+              if attempts == Bosh::OpenStackCloud::Openstack::MAX_RETRIES
+                @openstack.cloud_error("Failed after #{attempts} attempts with '#{e.message}'")
+              end
+            elsif
+              membership_id = @openstack
+                                  .network
+                                  .list_lbaas_pool_members(pool_id)
+                                  .body
+                                  .fetch('members', [])
+                                  .detect(
+                                      raise_if_not_found(pool_id, ip, port),
+                                      &matching_member(ip, port, subnet_id)
+                                  )
+                                  .fetch('id')
 
-          @logger.info("Load balancer pool membership with pool id '#{pool_id}', ip '#{ip}', and port '#{port}' already exists. The membership has the id '#{membership_id}'.")
-
-          membership_id
+              @logger.info("Load balancer pool membership with pool id '#{pool_id}', ip '#{ip}', and port '#{port}' already exists. The membership has the id '#{membership_id}'.")
+              membership_id
+            end
+            pool_created = false
+          end until pool_created
         end
       end
     end
@@ -79,15 +93,29 @@ module Bosh::OpenStackCloud
       begin
         loadbalancer_id = loadbalancer_id(pool_id)
         resource = LoadBalancerResource.new(loadbalancer_id, @openstack)
-        @openstack.wait_resource(resource, :active, :provisioning_status)
-        @openstack.with_openstack do
-          begin
-            @openstack.network.delete_lbaas_pool_member(pool_id, membership_id)
-          rescue Fog::Network::OpenStack::NotFound
-            @logger.debug("Skipping deletion of lbaas pool member. Member with pool_id '#{pool_id}' and membership_id '#{membership_id}' does not exist.")
+        attempts = 0
+
+        begin
+          @openstack.wait_resource(resource, :active, :provisioning_status)
+          member_deleted = @openstack.with_openstack do
+            begin
+              attempts += 1
+              @openstack.network.delete_lbaas_pool_member(pool_id, membership_id)
+              true
+            rescue Fog::Network::OpenStack::NotFound
+              @logger.debug("Skipping deletion of lbaas pool member. Member with pool_id '#{pool_id}' and membership_id '#{membership_id}' does not exist.")
+              true
+            rescue Excon::Error::Conflict => e
+              @logger.debug("Deletion of lbaas pool member failed with '#{e.message}', unsuccessful attempts: '#{attempts}'")
+              if attempts == Bosh::OpenStackCloud::Openstack::MAX_RETRIES
+                @openstack.cloud_error("Failed after #{attempts} attempts with '#{e.message}'")
+              end
+              false
+            end
           end
-        end
+        end until member_deleted
         @openstack.wait_resource(resource, :active, :provisioning_status)
+
       rescue LoadBalancerResource::NotFound => e
         @logger.debug("Skipping deletion of lbaas pool member because load balancer resource cannot be found. #{e.message}")
       rescue => e
